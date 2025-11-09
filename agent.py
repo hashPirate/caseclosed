@@ -1,568 +1,472 @@
 import os
 import time
-import numpy as np
+import copy
 from flask import Flask, request, jsonify
 from threading import Lock
-from collections import deque, defaultdict
+from collections import deque
+import numpy as np
 from enum import Enum
 import sys
 
+# Set a higher recursion limit for deep minimax search
 sys.setrecursionlimit(2500)
 
+# --- Core Game Constants (Unchanged) ---
 class Direction(Enum):
     UP = (0, -1); DOWN = (0, 1); RIGHT = (1, 0); LEFT = (-1, 0)
-
 DIRECTION_MAP = {d.name: d for d in Direction}
 OPPOSITE_DIR = {
     Direction.UP: Direction.DOWN, Direction.DOWN: Direction.UP,
     Direction.LEFT: Direction.RIGHT, Direction.RIGHT: Direction.LEFT
 }
+GRID_HEIGHT = 18; GRID_WIDTH = 20; EMPTY = 0; AGENT_TRAIL = 1
 
-GRID_HEIGHT = 18; GRID_WIDTH = 20
-MAX_SEARCH_DEPTH = 50
-MAX_TIME_MS = 3750  # Tighter buffer
-WIN_SCORE = 999999
-LOSE_SCORE = -999999
-DRAW_SCORE = 0
+# --- Search Configuration ---
+MAX_SEARCH_DEPTH = 30 
+MAX_TIME_MS = 3800  # 3.8 seconds max per move (4s limit)
 
-# === BITBOARD ===
-class BitBoard:
-    __slots__ = ['occupied']
-    
-    def __init__(self, occupied=0):
-        self.occupied = occupied
-    
-    def set(self, x, y):
-        bit = y * GRID_WIDTH + x
-        self.occupied |= (1 << bit)
-    
-    def is_occupied(self, x, y):
-        bit = y * GRID_WIDTH + x
-        return (self.occupied >> bit) & 1
-    
-    def copy(self):
-        return BitBoard(self.occupied)
-
-# === ADJACENCY MASKS ===
-ADJ_MASKS = [0] * 360
-for i in range(360):
-    x, y = i % GRID_WIDTH, i // GRID_WIDTH
-    mask = 0
-    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-        nx, ny = (x + dx) % GRID_WIDTH, (y + dy) % GRID_HEIGHT
-        mask |= (1 << (ny * GRID_WIDTH + nx))
-    ADJ_MASKS[i] = mask
-
-# === ZOBRIST WITH HEADS ===
-np.random.seed(42)
-ZOBRIST_POS = np.random.randint(1, 2**63 - 1, 360, dtype=np.uint64)
-ZOBRIST_HEAD = np.random.randint(1, 2**63 - 1, (2, 360), dtype=np.uint64)
-ZOBRIST_BOOST = np.random.randint(1, 2**63 - 1, (2, 4), dtype=np.uint64)
-
-def compute_hash(bitboard, my_head, opp_head, boost1, boost2):
-    """Hash with heads included"""
-    h = np.uint64(0)
-    temp = bitboard.occupied
-    while temp:
-        lsb = temp & -temp
-        bit_pos = lsb.bit_length() - 1
-        temp ^= lsb
-        h ^= ZOBRIST_POS[bit_pos]
-    
-    # Include heads in hash
-    h ^= ZOBRIST_HEAD[0, my_head[1] * GRID_WIDTH + my_head[0]]
-    h ^= ZOBRIST_HEAD[1, opp_head[1] * GRID_WIDTH + opp_head[0]]
-    h ^= ZOBRIST_BOOST[0, min(3, boost1)]
-    h ^= ZOBRIST_BOOST[1, min(3, boost2)]
-    return h
-
-# === VORONOI (NO DOUBLE-COUNTING) ===
-def voronoi_territory(bitboard, my_head, opp_head):
-    """Voronoi that doesn't double-count shared regions"""
-    my_bit = my_head[1] * GRID_WIDTH + my_head[0]
-    opp_bit = opp_head[1] * GRID_WIDTH + opp_head[0]
-    
-    my_territory = 1 << my_bit
-    opp_territory = 1 << opp_bit
-    my_frontier = 1 << my_bit
-    opp_frontier = 1 << opp_bit
-    visited = (1 << my_bit) | (1 << opp_bit)
-    contested = 0  # Shared cells
-    
-    for _ in range(25):
-        if not my_frontier and not opp_frontier:
-            break
-        
-        new_my = 0
-        new_opp = 0
-        
-        # Expand my territory
-        if my_frontier:
-            temp = my_frontier
-            while temp:
-                lsb = temp & -temp
-                bit_pos = lsb.bit_length() - 1
-                temp ^= lsb
-                available = ADJ_MASKS[bit_pos] & ~bitboard.occupied & ~visited
-                new_my |= available
-                visited |= available
-        
-        # Expand opp territory
-        if opp_frontier:
-            temp = opp_frontier
-            while temp:
-                lsb = temp & -temp
-                bit_pos = lsb.bit_length() - 1
-                temp ^= lsb
-                available = ADJ_MASKS[bit_pos] & ~bitboard.occupied & ~visited
-                new_opp |= available
-                visited |= available
-        
-        # Find contested cells (reached by both in same iteration)
-        overlap = new_my & new_opp
-        contested |= overlap
-        
-        # Remove contested from both
-        new_my &= ~overlap
-        new_opp &= ~overlap
-        
-        my_territory |= new_my
-        opp_territory |= new_opp
-        my_frontier = new_my
-        opp_frontier = new_opp
-    
-    my_count = my_territory.bit_count()
-    opp_count = opp_territory.bit_count()
-    contested_count = contested.bit_count()
-    
-    return my_count, opp_count, contested_count
-
-# === ARTICULATION POINT DETECTION (SIMPLIFIED) ===
-def find_chokepoints(bitboard, head):
-    """Find critical cells (removing them disconnects large regions)"""
-    chokepoints = []
-    head_bit = head[1] * GRID_WIDTH + head[0]
-    
-    # Original reachable area
-    original_reach = flood_fill_bitboard(bitboard, head[0], head[1])
-    
-    # Test each neighbor
-    for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
-        nx, ny = (head[0] + dx) % GRID_WIDTH, (head[1] + dy) % GRID_HEIGHT
-        if not bitboard.is_occupied(nx, ny):
-            # Temporarily block this cell
-            test_bb = bitboard.copy()
-            test_bb.set(nx, ny)
-            
-            # Check if reachability drops significantly
-            new_reach = flood_fill_bitboard(test_bb, head[0], head[1])
-            if new_reach < original_reach * 0.5:  # Lost 50%+ of space
-                chokepoints.append((nx, ny))
-    
-    return len(chokepoints)
-
-def flood_fill_bitboard(bitboard, x, y):
-    """Fast flood fill"""
-    bit = y * GRID_WIDTH + x
-    if (bitboard.occupied >> bit) & 1:
-        return 0
-    
-    visited = 1 << bit
-    frontier = 1 << bit
-    count = 1
-    
-    while frontier:
-        new_frontier = 0
-        temp = frontier
-        while temp:
-            lsb = temp & -temp
-            bit_pos = lsb.bit_length() - 1
-            temp ^= lsb
-            available = ADJ_MASKS[bit_pos] & ~bitboard.occupied & ~visited
-            new_frontier |= available
-            visited |= available
-        count += new_frontier.bit_count()
-        frontier = new_frontier
-    
-    return count
-
-def count_liberties(bitboard, x, y):
-    bit = y * GRID_WIDTH + x
-    adj_mask = ADJ_MASKS[bit]
-    free = adj_mask & ~bitboard.occupied
-    return free.bit_count()
-
-# === TT WITH LRU REPLACEMENT ===
-class TTEntry:
-    __slots__ = ['score', 'age']
-    def __init__(self, score, age):
-        self.score = score
-        self.age = age
-
+# --- Transposition Table (Cache) ---
 TT_CACHE = {}
-MAX_CACHE_SIZE = 2_000_000  # 4x larger
-TT_AGE = 0
-
-# === GLOBALS ===
 START_TIME = 0.0
-NODES_SEARCHED = 0
-LAST_TIME_CHECK = 0.0
 
+# --- Flask API server setup (Unchanged) ---
 app = Flask(__name__)
+
+# --- Global State Management (Unchanged) ---
 GLOBAL_GAME_STATE = {
     "board": None, "agent1_trail": deque(), "agent2_trail": deque(),
     "agent1_boosts": 3, "agent2_boosts": 3, "turn_count": 0,
     "player_number": 1, "my_direction": Direction.RIGHT, "opp_direction": Direction.LEFT
 }
+WEIGHT_PROFILES = {
+    "standard": {
+        "space": 1.0, "center": 0.5, "pressure": 0.2, "trapping": 1.0, 
+        "openness": 0.5, "boost_preservation": 5.0
+    },
+    "counter_aggressive": {
+        "space": 1.0, "center": 0.1, "pressure": 0.1, "trapping": 3.0, 
+        "openness": 1.5, "boost_preservation": 5.0
+    },
+    "punish_defensive": {
+        "space": 1.5, "center": 0.8, "pressure": 1.0, "trapping": 1.0, 
+        "openness": 0.5, "boost_preservation": 5.0
+    }
+}
+CURRENT_OPPONENT_STRATEGY = "standard"
 game_lock = Lock()
 
-PARTICIPANT = "TOURNAMENT_CHAMPION"
-AGENT_NAME = "TournamentChampion_v29"
+# --- Agent Identity ---
+PARTICIPANT = "GeminiAI_Agent"
+AGENT_NAME = "CaseClosed_FinalBoss_v8_Fixed"
 
-def _torus(pos):
-    return (pos[0] % GRID_WIDTH, pos[1] % GRID_HEIGHT)
-
-class TimeLimitExceeded(Exception):
-    pass
-
-def get_final_position(head, direction, use_boost):
-    dx, dy = direction.value
-    if use_boost:
-        nx1, ny1 = _torus((head[0] + dx, head[1] + dy))
-        nx2, ny2 = _torus((nx1 + dx, ny1 + dy))
-        return (nx2, ny2)
+# --- All Heuristic Functions (Unchanged from v5) ---
+def _torus_check(pos):
+    x, y = pos
+    normalized_x = x % GRID_WIDTH
+    normalized_y = y % GRID_HEIGHT
+    return (normalized_x, normalized_y)
+def calculate_voronoi_space(board, my_head, opp_head):
+    my_space = 0; opp_space = 0
+    q_my = deque([(my_head, 1)]); q_opp = deque([(opp_head, 1)])
+    visited = {}; visited[my_head] = (1, 0); visited[opp_head] = (2, 0)
+    are_separated = True
+    while q_my or q_opp:
+        if q_my:
+            my_curr, my_dist = q_my.popleft()
+            for direction in Direction:
+                dx, dy = direction.value
+                next_pos = _torus_check((my_curr[0] + dx, my_curr[1] + dy))
+                if board[next_pos[1], next_pos[0]] == EMPTY:
+                    if next_pos not in visited:
+                        visited[next_pos] = (1, my_dist); my_space += 1
+                        q_my.append((next_pos, my_dist + 1))
+                    elif visited[next_pos][0] == 2 and my_dist < visited[next_pos][1]:
+                        are_separated = False
+        if q_opp:
+            opp_curr, opp_dist = q_opp.popleft()
+            for direction in Direction:
+                dx, dy = direction.value
+                next_pos = _torus_check((opp_curr[0] + dx, opp_curr[1] + dy))
+                if board[next_pos[1], next_pos[0]] == EMPTY:
+                    if next_pos not in visited:
+                        visited[next_pos] = (2, opp_dist); opp_space += 1
+                        q_opp.append((next_pos, opp_dist + 1))
+                    elif visited[next_pos][0] == 1 and opp_dist == visited[next_pos][1]:
+                        are_separated = False
+    if are_separated and (my_space > 0 or opp_space > 0):
+        my_space = flood_fill(board, my_head)
+        opp_space = flood_fill(board, opp_head)
+    return my_space, opp_space, are_separated
+def flood_fill(board, start_pos):
+    visited = set(); q = deque()
+    if board[start_pos[1], start_pos[0]] == EMPTY:
+        q.append(start_pos); visited.add(start_pos); count = 1
     else:
-        return _torus((head[0] + dx, head[1] + dy))
+        q.append(start_pos); visited.add(start_pos); count = 0
+    while q:
+        x, y = q.popleft()
+        for dx, dy in [(0, 1), (0, -1), (1, 0), (-1, 0)]:
+            next_x, next_y = _torus_check((x + dx, y + dy))
+            next_pos = (next_x, next_y)
+            if next_pos not in visited and board[next_y, next_x] == EMPTY:
+                visited.add(next_pos); q.append(next_pos); count += 1
+    return count
+def calculate_center_distance(pos):
+    center_x, center_y = GRID_WIDTH // 2, GRID_HEIGHT // 2
+    return abs(pos[0] - center_x) + abs(pos[1] - center_y)
+def calculate_center_bonus(my_head, opp_head, my_id, turn_count):
+    my_dist = calculate_center_distance(my_head); opp_dist = calculate_center_distance(opp_head)
+    phase_weight = max(0, 1.0 - turn_count / 100.0)
+    if my_id == 1: my_dist -= 0.5
+    else: my_dist += 0.5
+    return (opp_dist - my_dist) * 2.0 * phase_weight
+def calculate_opponent_distance(my_head, opp_head):
+    return abs(my_head[0] - opp_head[0]) + abs(my_head[1] - opp_head[1])
+def calculate_pressure_score(my_head, opp_head, turn_count):
+    distance = calculate_opponent_distance(my_head, opp_head)
+    if turn_count < 12: return 0
+    if 5 <= distance <= 10: return 5.0
+    elif distance < 5: return -2.0
+    elif distance > 15: return -3.0
+    else: return 0
+def count_escape_routes(board, pos):
+    safe_directions = 0
+    for direction in Direction:
+        dx, dy = direction.value
+        next_pos = _torus_check((pos[0] + dx, pos[1] + dy))
+        if board[next_pos[1], next_pos[0]] == EMPTY:
+            safe_directions += 1
+    return safe_directions
+def calculate_escape_quality(board, my_head, opp_head):
+    my_routes = count_escape_routes(board, my_head); opp_routes = count_escape_routes(board, opp_head)
+    route_advantage = (my_routes - opp_routes) * 4.0
+    if opp_routes == 0 and my_routes > 0: route_advantage += 1000.0
+    elif opp_routes == 1 and my_routes > 2: route_advantage += 50.0
+    elif opp_routes <= 2 and my_routes > 3: route_advantage += 25.0
+    if my_routes >= 4: route_advantage += 10.0
+    elif my_routes == 3: route_advantage += 5.0
+    if my_routes == 0: route_advantage -= 1000.0
+    elif my_routes == 1: route_advantage -= 75.0
+    return route_advantage
+def calculate_trapping_bonus(board, my_space, opp_space, my_head, opp_head):
+    return calculate_escape_quality(board, my_head, opp_head)
+def calculate_openness_bonus(board, my_head, my_space):
+    board_size = board.shape[0] * board.shape[1]; openness_ratio = my_space / board_size
+    if openness_ratio > 0.35: return 15.0
+    elif openness_ratio > 0.25: return 10.0
+    elif openness_ratio > 0.15: return 0
+    elif openness_ratio > 0.08: return -15.0
+    else: return -40.0
+def get_game_phase(turn_count):
+    if turn_count < 20: return "early"
+    elif turn_count < 60: return "mid"
+    else: return "late"
+def evaluate_state(state, my_id, weights):
+    board = state["board"]; turn_count = state.get("turn_count", 0)
+    my_head = state["agent1_trail"][-1]; opp_head = state["agent2_trail"][-1]
+    my_boosts = state["agent1_boosts"]
+    my_routes = count_escape_routes(board, my_head)
+    opp_routes = count_escape_routes(board, opp_head)
+    if my_routes == 0: return -999999
+    if opp_routes == 0 and my_routes > 0: return 999999
+    my_space, opp_space, are_separated = calculate_voronoi_space(board, my_head, opp_head)
+    if my_routes == 1 and my_space < 15:
+        return -800000 + my_space * 1000
+    if are_separated:
+        space_score = my_space - opp_space
+        openness = calculate_openness_bonus(board, my_head, my_space)
+        final_score = (weights["space"] * space_score * 5.0 + weights["openness"] * openness * 2.0)
+    else:
+        space_score = my_space - opp_space
+        center_bonus = calculate_center_bonus(my_head, opp_head, my_id, turn_count)
+        pressure_score = calculate_pressure_score(my_head, opp_head, turn_count)
+        route_advantage = (my_routes - opp_routes) * 4.0
+        openness = calculate_openness_bonus(board, my_head, my_space)
+        boost_score = weights["boost_preservation"] * my_boosts
+        final_score = (
+            weights["space"] * space_score + weights["center"] * center_bonus +
+            weights["pressure"] * pressure_score + weights["trapping"] * route_advantage +
+            weights["openness"] * openness + boost_score
+        )
+    return final_score
 
-def path_cells(head, direction, steps):
-    dx, dy = direction.value
-    cells = []
-    x, y = head
-    for _ in range(steps):
-        x, y = _torus((x + dx, y + dy))
-        cells.append((x, y))
-    return cells
+# --- (FIX) THIS FUNCTION WAS MISSING ---
+def get_possible_moves(agent_dir, boosts_remaining):
+    valid_moves = []
+    for direction in Direction:
+        if direction != OPPOSITE_DIR.get(agent_dir):
+            valid_moves.append((direction, False))
+            if boosts_remaining > 0:
+                valid_moves.append((direction, True))
+    return valid_moves
 
-def joint_collision(my_head, opp_head, my_dir, opp_dir, my_boost, opp_boost):
-    my_path = path_cells(my_head, my_dir, 2 if my_boost else 1)
-    opp_path = path_cells(opp_head, opp_dir, 2 if opp_boost else 1)
-    
-    if my_path[-1] == opp_path[-1]:
-        return "draw"
-    
-    max_steps = max(len(my_path), len(opp_path))
-    for i in range(max_steps):
-        a = my_path[i] if i < len(my_path) else my_path[-1]
-        b = opp_path[i] if i < len(opp_path) else opp_path[-1]
-        if a == b:
-            return "draw"
-    
-    if len(my_path) == len(opp_path) == 1:
-        if my_path[0] == opp_head and opp_path[0] == my_head:
-            return "draw"
-    
-    return "continue"
+# --- High-Speed Simulation & Search Logic (Unchanged) ---
+def simulate_move_inplace(state, player_id, direction, use_boost):
+    if player_id == 1:
+        trail = state["agent1_trail"]; boosts_key = "agent1_boosts"; dir_key = "my_direction"
+    else:
+        trail = state["agent2_trail"]; boosts_key = "agent2_boosts"; dir_key = "opp_direction"
+    original_boosts = state[boosts_key]; original_direction = state[dir_key]
+    undo_actions = []; num_steps = 1
+    if use_boost and state[boosts_key] > 0:
+        num_steps = 2; state[boosts_key] -= 1
+        undo_actions.append(("boost", original_boosts, boosts_key))
+    agent_alive = True
+    for _ in range(num_steps):
+        if not agent_alive: break
+        current_head = trail[-1]; dx, dy = direction.value
+        next_head = _torus_check((current_head[0] + dx, current_head[1] + dy))
+        if state["board"][next_head[1], next_head[0]] == AGENT_TRAIL:
+            agent_alive = False; break
+        state["board"][next_head[1], next_head[0]] = AGENT_TRAIL
+        trail.append(next_head)
+        undo_actions.append(("move", next_head, player_id))
+    if agent_alive:
+        state[dir_key] = direction
+    undo_actions.append(("direction", original_direction, dir_key))
+    return agent_alive, undo_actions
 
-# === ENHANCED EVALUATION ===
-def evaluate(bitboard, my_head, opp_head, my_boosts, opp_boosts):
-    """Enhanced evaluation with chokepoint detection and Voronoi"""
-    my_libs = count_liberties(bitboard, my_head[0], my_head[1])
-    opp_libs = count_liberties(bitboard, opp_head[0], opp_head[1])
-    
-    if my_libs == 0 and opp_libs == 0:
-        return DRAW_SCORE
-    if my_libs == 0:
-        return LOSE_SCORE
-    if opp_libs == 0:
-        return WIN_SCORE
-    
-    score = 0
-    
-    # Mobility
-    score += (my_libs - opp_libs) * 2000
-    
-    # Trapping
-    if opp_libs == 1:
-        score += 20000
-    elif opp_libs == 2:
-        score += 8000
-    if my_libs == 1:
-        score -= 25000
-    elif my_libs == 2:
-        score -= 12000
-    
-    # Distance
-    dist = abs(my_head[0] - opp_head[0]) + abs(my_head[1] - opp_head[1])
-    
-    # Use Voronoi (no double-counting)
-    my_territory, opp_territory, contested = voronoi_territory(bitboard, my_head, opp_head)
-    
-    # Weight contested cells less
-    effective_my = my_territory + contested * 0.3
-    effective_opp = opp_territory + contested * 0.3
-    
-    territory_weight = 200 if dist > 8 else 80
-    score += (effective_my - effective_opp) * territory_weight
-    
-    # Chokepoint detection
-    my_chokes = find_chokepoints(bitboard, my_head)
-    opp_chokes = find_chokepoints(bitboard, opp_head)
-    
-    # Being in a chokepoint is bad
-    score -= my_chokes * 3000
-    score += opp_chokes * 3000
-    
-    score += (my_boosts - opp_boosts) * 800
-    
-    return score
+def undo_moves(state, undo_actions):
+    for action in reversed(undo_actions):
+        if action[0] == "move":
+            pos = action[1]; player_id = action[2]
+            state["board"][pos[1], pos[0]] = EMPTY
+            if player_id == 1: state["agent1_trail"].pop()
+            else: state["agent2_trail"].pop()
+        elif action[0] == "boost":
+            state[action[2]] = action[1]
+        elif action[0] == "direction":
+            state[action[2]] = action[1]
 
-def get_moves(direction, boosts):
-    moves = []
-    for d in Direction:
-        if d != OPPOSITE_DIR.get(direction):
-            moves.append((d, False))
-            if boosts > 0:
-                moves.append((d, True))
-    return moves
-
-def order_moves(bitboard, head, direction, boosts, opp_head):
-    moves = get_moves(direction, boosts)
-    scored = []
-    
-    for d, b in moves:
-        fin = get_final_position(head, d, b)
-        
-        if bitboard.is_occupied(fin[0], fin[1]) and fin != opp_head:
-            continue
-        
-        libs = count_liberties(bitboard, fin[0], fin[1])
-        centerish = -(abs(fin[0] - GRID_WIDTH // 2) + abs(fin[1] - GRID_HEIGHT // 2))
-        conserve = 1 if not b else 0
-        
-        # Penalty for moves toward chokepoints
-        test_bb = bitboard.copy()
-        test_bb.set(fin[0], fin[1])
-        future_reach = flood_fill_bitboard(test_bb, fin[0], fin[1])
-        
-        score = libs * 100 + centerish * 2 + conserve * 5 + future_reach * 0.5
-        scored.append((score, (d, b)))
-    
-    scored.sort(key=lambda x: x[0], reverse=True)
-    return [m for _, m in scored]
-
-# === MINIMAX WITH TIGHT TIME CONTROL ===
-def maximin_value(bitboard, my_head, opp_head, my_dir, opp_dir, my_boosts, opp_boosts, depth, alpha, beta):
-    global NODES_SEARCHED, START_TIME, TT_AGE, LAST_TIME_CHECK
-    
-    NODES_SEARCHED += 1
-    
-    # TIGHT time check (every 256 nodes)
-    if (NODES_SEARCHED & 255) == 0:
-        current_time = time.time() * 1000
-        if current_time > START_TIME + MAX_TIME_MS:
-            raise TimeLimitExceeded()
-        LAST_TIME_CHECK = current_time
-    
-    if depth == 0:
-        return evaluate(bitboard, my_head, opp_head, my_boosts, opp_boosts)
-    
-    # TT with heads
-    state_hash = compute_hash(bitboard, my_head, opp_head, my_boosts, opp_boosts)
-    cache_key = (state_hash, my_dir, opp_dir, my_boosts, opp_boosts, depth)
-    
+def minimax_search(state, depth, is_max_turn, my_id, alpha, beta, weights):
+    global TT_CACHE, START_TIME, MAX_TIME_MS
+    if time.time() * 1000 > START_TIME + MAX_TIME_MS:
+        return 0 
+    state_hash = (
+        tuple(state["agent1_trail"]), tuple(state["agent2_trail"]),
+        state["agent1_boosts"], state["agent2_boosts"],
+        state["my_direction"], state["opp_direction"]
+    )
+    cache_key = (state_hash, depth)
     if cache_key in TT_CACHE:
-        entry = TT_CACHE[cache_key]
-        entry.age = TT_AGE
-        return entry.score
-    
-    my_moves = order_moves(bitboard, my_head, my_dir, my_boosts, opp_head)
-    opp_moves = order_moves(bitboard, opp_head, opp_dir, opp_boosts, my_head)
-    
-    if not my_moves:
-        return LOSE_SCORE
-    if not opp_moves:
-        return WIN_SCORE
-    
-    best_value = -np.inf
-    
-    for my_move_dir, my_boost in my_moves:
-        my_final = get_final_position(my_head, my_move_dir, my_boost)
-        worst_case = np.inf
-        
-        for opp_move_dir, opp_boost in opp_moves:
-            opp_final = get_final_position(opp_head, opp_move_dir, opp_boost)
-            
-            outcome = joint_collision(my_head, opp_head, my_move_dir, opp_move_dir, my_boost, opp_boost)
-            if outcome == "draw":
-                value = DRAW_SCORE
-                worst_case = min(worst_case, value)
-                if worst_case <= alpha:
-                    break
-                continue
-            
-            mid = path_cells(my_head, my_move_dir, 1)[0] if my_boost else None
-            mid2 = path_cells(opp_head, opp_move_dir, 1)[0] if opp_boost else None
-            
-            if mid2 is not None and my_final == mid2:
-                value = LOSE_SCORE
-                worst_case = min(worst_case, value)
-                if worst_case <= alpha:
-                    break
-                continue
-            
-            if mid is not None and opp_final == mid:
-                value = WIN_SCORE
-                worst_case = min(worst_case, value)
-                if worst_case <= alpha:
-                    break
-                continue
-            
-            new_bb = bitboard.copy()
-            if mid is not None:
-                new_bb.set(mid[0], mid[1])
-            new_bb.set(my_final[0], my_final[1])
-            if mid2 is not None:
-                new_bb.set(mid2[0], mid2[1])
-            new_bb.set(opp_final[0], opp_final[1])
-            
-            new_my_boosts = my_boosts - 1 if my_boost else my_boosts
-            new_opp_boosts = opp_boosts - 1 if opp_boost else opp_boosts
-            
-            value = maximin_value(
-                new_bb, my_final, opp_final, my_move_dir, opp_move_dir,
-                new_my_boosts, new_opp_boosts, depth - 1, alpha, beta
-            )
-            
-            worst_case = min(worst_case, value)
-            if worst_case <= alpha:
-                break
-        
-        best_value = max(best_value, worst_case)
-        alpha = max(alpha, best_value)
+        return TT_CACHE[cache_key]
+    if depth == 0:
+        return evaluate_state(state, my_id, weights)
+
+    max_id = 1; min_id = 2
+    max_dir = state["my_direction"]; min_dir = state["opp_direction"]
+    max_boosts = state["agent1_boosts"]; min_boosts = state["agent2_boosts"]
+    value = -np.inf
+    max_moves = get_possible_moves(max_dir, max_boosts)
+    min_moves = get_possible_moves(min_dir, min_boosts)
+    max_moves.sort(key=lambda m: m[1]) # Sort non-boosts first
+
+    for my_dir, my_boost in max_moves:
+        worst_case_score = np.inf
+        my_survived, my_undo = simulate_move_inplace(state, max_id, my_dir, my_boost)
+        for opp_dir, opp_boost in min_moves:
+            opp_survived, opp_undo = simulate_move_inplace(state, min_id, opp_dir, opp_boost)
+            state["turn_count"] += 1
+            if not my_survived and not opp_survived: score = 0
+            elif not my_survived: score = -999999
+            elif not opp_survived: score = 999999
+            else:
+                score = minimax_search(state, depth - 1, True, my_id, alpha, beta, weights)
+            state["turn_count"] -= 1
+            undo_moves(state, opp_undo)
+            worst_case_score = min(worst_case_score, score)
+            if worst_case_score <= alpha:
+                break 
+        undo_moves(state, my_undo)
+        value = max(value, worst_case_score)
+        alpha = max(alpha, value)
         if alpha >= beta:
             break
-    
-    # TT with LRU replacement
-    if len(TT_CACHE) >= MAX_CACHE_SIZE:
-        # Remove oldest entry
-        oldest_key = min(TT_CACHE.keys(), key=lambda k: TT_CACHE[k].age)
-        del TT_CACHE[oldest_key]
-    
-    TT_CACHE[cache_key] = TTEntry(best_value, TT_AGE)
-    
-    return best_value
+    TT_CACHE[cache_key] = value
+    return value
 
-# === ROOT SEARCH ===
-def get_best_move(state):
-    global START_TIME, NODES_SEARCHED, TT_CACHE, TT_AGE, LAST_TIME_CHECK
-    
+# --- (CHANGED) Root-Level Search (get_best_move) ---
+def get_best_move(state, my_id):
+    global CURRENT_OPPONENT_STRATEGY, START_TIME, TT_CACHE
     START_TIME = time.time() * 1000
-    LAST_TIME_CHECK = START_TIME
-    NODES_SEARCHED = 0
-    TT_AGE = 0
     TT_CACHE.clear()
+
+    turn_count = state.get("turn_count", 0)
     
-    bitboard = BitBoard()
-    for x, y in state["agent1_trail"]:
-        bitboard.set(x, y)
-    for x, y in state["agent2_trail"]:
-        bitboard.set(x, y)
-    
-    my_head = state["agent1_trail"][-1]
-    opp_head = state["agent2_trail"][-1]
-    my_dir = state["my_direction"]
-    opp_dir = state["opp_direction"]
-    my_boosts = state["agent1_boosts"]
-    opp_boosts = state["agent2_boosts"]
-    
-    valid_moves = order_moves(bitboard, my_head, my_dir, my_boosts, opp_head)
-    if not valid_moves:
-        return "RIGHT"
-    
-    best_move = valid_moves[0]
-    best_score = -np.inf
-    
-    try:
-        for depth in range(1, MAX_SEARCH_DEPTH + 1):
-            TT_AGE += 1
+    # (Opponent modeling - unchanged)
+    if turn_count > 10 and turn_count % 10 == 0:
+        my_head = state["agent1_trail"][-1]; opp_head = state["agent2_trail"][-1]
+        distance = calculate_opponent_distance(my_head, opp_head)
+        if distance < 5: CURRENT_OPPONENT_STRATEGY = "counter_aggressive"
+        elif distance > 15: CURRENT_OPPONENT_STRATEGY = "punish_defensive"
+        elif calculate_center_distance(opp_head) < 4: CURRENT_OPPONENT_STRATEGY = "standard"
+        else: CURRENT_OPPONENT_STRATEGY = "standard"
             
-            elapsed = time.time() * 1000 - START_TIME
-            if elapsed > MAX_TIME_MS - 300:
+    my_dir = state["my_direction"]; my_boosts = state["agent1_boosts"]
+    opp_dir = state["opp_direction"]; opp_boosts = state["agent2_boosts"]
+
+    my_moves = get_possible_moves(my_dir, my_boosts)
+    opp_moves = get_possible_moves(opp_dir, opp_boosts)
+    
+    if not my_moves: # No moves possible
+        return "UP" # Forfeit
+
+    move_scores = {move: -np.inf for move in my_moves}
+
+    best_move = (my_dir, False) 
+    if (my_dir, False) not in my_moves:
+        best_move = my_moves[0] 
+    
+    max_score = -np.inf
+    selected_weights = WEIGHT_PROFILES[CURRENT_OPPONENT_STRATEGY].copy()
+    phase = get_game_phase(state.get("turn_count", 0))
+    if phase == "mid": selected_weights["trapping"] *= 1.5  
+    elif phase == "late": selected_weights["trapping"] *= 3.0
+
+    ASPIRATION_WINDOW_SIZE = 50.0 
+
+    for depth in range(2, MAX_SEARCH_DEPTH + 2, 2):
+        if time.time() * 1000 > START_TIME + MAX_TIME_MS:
+            print(f"Time limit. Using best from depth {depth-2}.")
+            break
+
+        print(f"--- Starting search for depth {depth} ---")
+        current_best_move_for_depth = best_move
+        current_max_score_for_depth = -np.inf
+
+        if depth == 2:
+            alpha, beta = -np.inf, np.inf
+        else:
+            alpha = max_score - ASPIRATION_WINDOW_SIZE
+            beta = max_score + ASPIRATION_WINDOW_SIZE
+        
+        sorted_moves = sorted(my_moves, key=lambda m: move_scores[m], reverse=True)
+
+        # --- (FIX) This loop is now IN-PLACE ---
+        for move_dir, move_boost in sorted_moves:
+            worst_case_score = np.inf
+            
+            my_survived, my_undo = simulate_move_inplace(state, 1, move_dir, move_boost)
+            
+            for opp_move_dir, opp_move_boost in opp_moves:
+                opp_survived, opp_undo = simulate_move_inplace(state, 2, opp_move_dir, opp_move_boost)
+                state["turn_count"] += 1
+                
+                if not my_survived and not opp_survived: score = 0
+                elif not my_survived: score = -999999
+                elif not opp_survived: score = 999999
+                else:
+                    score = minimax_search(state, depth - 1, True, my_id, alpha, beta, selected_weights)
+                
+                state["turn_count"] -= 1
+                undo_moves(state, opp_undo)
+                worst_case_score = min(worst_case_score, score)
+                if worst_case_score <= alpha:
+                   break
+            
+            undo_moves(state, my_undo)
+            
+            move_scores[(move_dir, move_boost)] = worst_case_score
+            
+            if worst_case_score > current_max_score_for_depth:
+                current_max_score_for_depth = worst_case_score
+                current_best_move_for_depth = (move_dir, move_boost)
+            
+            alpha = max(alpha, current_max_score_for_depth) 
+
+            if time.time() * 1000 > START_TIME + MAX_TIME_MS:
                 break
+        
+        # --- (FIX) Aspiration Window Re-search ---
+        if (depth > 2) and \
+           (current_max_score_for_depth <= (max_score - ASPIRATION_WINDOW_SIZE) or \
+            current_max_score_for_depth >= (max_score + ASPIRATION_WINDOW_SIZE)) and \
+            (time.time() * 1000 < START_TIME + MAX_TIME_MS): 
             
-            current_best = best_move
-            current_score = -np.inf
+            print(f"Aspiration window failed (score {current_max_score_for_depth}). Re-searching with full window...")
+            current_max_score_for_depth = -np.inf
+            alpha = -np.inf
+            beta = np.inf
             
-            for my_move_dir, my_boost in valid_moves:
-                my_final = get_final_position(my_head, my_move_dir, my_boost)
-                opp_moves = order_moves(bitboard, opp_head, opp_dir, opp_boosts, my_head)
-                worst_case = np.inf
+            for move_dir, move_boost in sorted_moves:
+                worst_case_score = np.inf
+                my_survived, my_undo = simulate_move_inplace(state, 1, move_dir, move_boost)
+                for opp_move_dir, opp_move_boost in opp_moves:
+                    opp_survived, opp_undo = simulate_move_inplace(state, 2, opp_move_dir, opp_move_boost)
+                    state["turn_count"] += 1 # Bugfix: was state_copy
+                    if not my_survived and not opp_survived: score = 0
+                    elif not my_survived: score = -999999
+                    elif not opp_survived: score = 999999
+                    else:
+                        score = minimax_search(state, depth - 1, True, my_id, alpha, beta, selected_weights)
+                    state["turn_count"] -= 1 # Bugfix: was state_copy
+                    undo_moves(state, opp_undo)
+                    worst_case_score = min(worst_case_score, score)
+                    if worst_case_score <= alpha: break
                 
-                for opp_move_dir, opp_boost in opp_moves:
-                    opp_final = get_final_position(opp_head, opp_move_dir, opp_boost)
-                    
-                    outcome = joint_collision(my_head, opp_head, my_move_dir, opp_move_dir, my_boost, opp_boost)
-                    if outcome == "draw":
-                        value = DRAW_SCORE
-                        worst_case = min(worst_case, value)
-                        continue
-                    
-                    mid = path_cells(my_head, my_move_dir, 1)[0] if my_boost else None
-                    mid2 = path_cells(opp_head, opp_move_dir, 1)[0] if opp_boost else None
-                    
-                    if mid2 is not None and my_final == mid2:
-                        value = LOSE_SCORE
-                        worst_case = min(worst_case, value)
-                        continue
-                    
-                    if mid is not None and opp_final == mid:
-                        value = WIN_SCORE
-                        worst_case = min(worst_case, value)
-                        continue
-                    
-                    new_bb = bitboard.copy()
-                    if mid is not None:
-                        new_bb.set(mid[0], mid[1])
-                    new_bb.set(my_final[0], my_final[1])
-                    if mid2 is not None:
-                        new_bb.set(mid2[0], mid2[1])
-                    new_bb.set(opp_final[0], opp_final[1])
-                    
-                    new_my_boosts = my_boosts - 1 if my_boost else my_boosts
-                    new_opp_boosts = opp_boosts - 1 if opp_boost else opp_boosts
-                    
-                    value = maximin_value(
-                        new_bb, my_final, opp_final, my_move_dir, opp_move_dir,
-                        new_my_boosts, new_opp_boosts, depth - 1, -np.inf, np.inf
-                    )
-                    
-                    worst_case = min(worst_case, value)
+                undo_moves(state, my_undo)
                 
-                if worst_case > current_score:
-                    current_score = worst_case
-                    current_best = (my_move_dir, my_boost)
-            
-            best_move = current_best
-            best_score = current_score
-            print(f"[D{depth}] {best_move[0].name}{':BOOST' if best_move[1] else ''} = {best_score:.0f} (n={NODES_SEARCHED:,})")
-    
-    except (TimeLimitExceeded, RecursionError):
-        pass
-    
-    move_dir, use_boost = best_move
-    move_str = move_dir.name
-    if use_boost:
+                move_scores[(move_dir, move_boost)] = worst_case_score
+                if worst_case_score > current_max_score_for_depth:
+                    current_max_score_for_depth = worst_case_score
+                    current_best_move_for_depth = (move_dir, move_boost)
+                alpha = max(alpha, current_max_score_for_depth)
+                if time.time() * 1000 > START_TIME + MAX_TIME_MS: break
+        
+        # --- Update Best Move ---
+        if time.time() * 1000 < START_TIME + MAX_TIME_MS:
+            best_move = current_best_move_for_depth
+            max_score = current_max_score_for_depth
+            print(f"Completed depth {depth}. Best move: {best_move[0].name}, Score: {max_score:.1f}")
+        else:
+            print(f"Timed out during depth {depth}. Reverting to move from depth {depth-2}.")
+            break
+
+    final_dir, final_boost = best_move
+    move_str = final_dir.name
+    if final_boost:
         move_str += ":BOOST"
-    
-    print(f"Final: {move_str} (score={best_score})")
+        
+    print(f"Turn {turn_count}: Chosen move {move_str} with estimated score {max_score}")
     return move_str
 
-# === FLASK ===
+# --- (CHANGED) Flask Endpoints and Helper Functions ---
+def decide_action(current_state, player_number):
+    """
+    This function now receives a DEEP COPY of the state
+    and can safely pass it to the in-place search.
+    """
+    state_to_process = current_state 
+    state_to_process["player_number"] = player_number
+    
+    # Ensure types are correct (e.g., if just received from judge)
+    if "board" in state_to_process and not isinstance(state_to_process["board"], np.ndarray):
+        state_to_process["board"] = np.array(state_to_process["board"], dtype=np.int8)
+    if "agent1_trail" in state_to_process and not isinstance(state_to_process["agent1_trail"], deque):
+        state_to_process["agent1_trail"] = deque(tuple(p) for p in state_to_process["agent1_trail"])
+    if "agent2_trail" in state_to_process and not isinstance(state_to_process["agent2_trail"], deque):
+        state_to_process["agent2_trail"] = deque(tuple(p) for p in state_to_process["agent2_trail"])
+    
+    state_to_process["my_direction"] = get_current_direction(state_to_process["agent1_trail"], 1)
+    state_to_process["opp_direction"] = get_current_direction(state_to_process["agent2_trail"], 2)
+    
+    if player_number == 2:
+        state_to_process["agent1_trail"], state_to_process["agent2_trail"] = \
+            state_to_process["agent2_trail"], state_to_process["agent1_trail"]
+        state_to_process["agent1_boosts"], state_to_process["agent2_boosts"] = \
+            state_to_process["agent2_boosts"], state_to_process["agent1_boosts"]
+        state_to_process["my_direction"], state_to_process["opp_direction"] = \
+            state_to_process["opp_direction"], state_to_process["my_direction"]
+    
+    # This state is now safe to be modified by the in-place search
+    move = get_best_move(state_to_process, player_number)
+    return move
+
 def get_current_direction(trail, player_id):
     if len(trail) < 2:
         return Direction.RIGHT if player_id == 1 else Direction.LEFT
-    head, prev = trail[-1], trail[-2]
-    dx, dy = head[0] - prev[0], head[1] - prev[1]
+    head = trail[-1]; prev = trail[-2]
+    dx = head[0] - prev[0]; dy = head[1] - prev[1]
     if abs(dx) > 1: dx = -1 if dx > 0 else 1
     if abs(dy) > 1: dy = -1 if dy > 0 else 1
     if dx == 1: return Direction.RIGHT
@@ -571,38 +475,19 @@ def get_current_direction(trail, player_id):
     if dy == -1: return Direction.UP
     return Direction.RIGHT if player_id == 1 else Direction.LEFT
 
-def decide_action(current_state, player_number):
-    import copy
-    state = copy.deepcopy(current_state)
-    
-    if "agent1_trail" in state:
-        state["agent1_trail"] = deque(tuple(p) for p in state["agent1_trail"])
-    if "agent2_trail" in state:
-        state["agent2_trail"] = deque(tuple(p) for p in state["agent2_trail"])
-    
-    state["my_direction"] = get_current_direction(state["agent1_trail"], 1)
-    state["opp_direction"] = get_current_direction(state["agent2_trail"], 2)
-    
-    if player_number == 2:
-        state["agent1_trail"], state["agent2_trail"] = state["agent2_trail"], state["agent1_trail"]
-        state["agent1_boosts"], state["agent2_boosts"] = state["agent2_boosts"], state["agent1_boosts"]
-        state["my_direction"], state["opp_direction"] = state["opp_direction"], state["my_direction"]
-    
-    try:
-        return get_best_move(state)
-    except Exception as e:
-        print(f"[ERROR: {e}]")
-        import traceback
-        traceback.print_exc()
-        return "RIGHT"
-
 def _update_local_game_from_post(data: dict):
     with game_lock:
         GLOBAL_GAME_STATE.update(data)
+        # Always convert to numpy/deque *immediately* on receive
+        if "board" in data:
+            GLOBAL_GAME_STATE["board"] = np.array(data["board"], dtype=np.int8)
         if "agent1_trail" in data:
             GLOBAL_GAME_STATE["agent1_trail"] = deque(tuple(p) for p in data["agent1_trail"])
         if "agent2_trail" in data:
             GLOBAL_GAME_STATE["agent2_trail"] = deque(tuple(p) for p in data["agent2_trail"])
+        
+        GLOBAL_GAME_STATE["my_direction"] = get_current_direction(GLOBAL_GAME_STATE["agent1_trail"], 1)
+        GLOBAL_GAME_STATE["opp_direction"] = get_current_direction(GLOBAL_GAME_STATE["agent2_trail"], 2)
 
 @app.route("/", methods=["GET"])
 def info():
@@ -611,8 +496,7 @@ def info():
 @app.route("/send-state", methods=["POST"])
 def receive_state():
     data = request.get_json()
-    if not data:
-        return jsonify({"error": "no json body"}), 400
+    if not data: return jsonify({"error": "no json body"}), 400
     _update_local_game_from_post(data)
     return jsonify({"status": "state received"}), 200
 
@@ -620,19 +504,18 @@ def receive_state():
 def send_move():
     player_number = request.args.get("player_number", default=1, type=int)
     with game_lock:
-        import copy
+        # (FIX) We MUST deepcopy ONCE to get a clean state for in-place search
         current_state = copy.deepcopy(GLOBAL_GAME_STATE)
-    try:
-        move = decide_action(current_state, player_number)
-        return jsonify({"move": move}), 200
-    except Exception as e:
-        print(f"[ERROR: {e}]")
-        return jsonify({"move": "RIGHT"}), 200
+        
+    # This 'current_state' is now safe to be modified in-place
+    move = decide_action(current_state, player_number)
+    return jsonify({"move": move}), 200
 
 @app.route("/end", methods=["POST"])
 def end_game():
     data = request.get_json()
     if data:
+        _update_local_game_from_post(data)
         result = data.get("result", "UNKNOWN")
         print(f"\nGame Over! Result: {result}")
     with game_lock:
@@ -641,7 +524,5 @@ def end_game():
 
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", "5008"))
-    print(f"=== {AGENT_NAME} ({PARTICIPANT}) on port {port} ===")
-    print(f"✅ Voronoi (no double-count) | ✅ Chokepoint detection | ✅ TT with heads + LRU")
-    print(f"✅ Tight time control (256 nodes) | ✅ 2M TT entries | ✅ Enhanced eval")
+    print(f"Starting {AGENT_NAME} ({PARTICIPANT}) on port {port}...")
     app.run(host="0.0.0.0", port=port, debug=False)
